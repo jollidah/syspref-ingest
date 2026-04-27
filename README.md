@@ -1,112 +1,139 @@
-# Video Digest Server 🎥
+# Video Digest Server
 
-[![Rust](https://img.shields.io/badge/language-Rust-orange.svg)](https://www.rust-lang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+Video Digest Server is a planned Rust/Tokio service for concurrent video uploads and FFmpeg transcoding.
 
-A high-performance video ingestion and transcoding server designed to act as a bridge between raw camera footage and the editing suite. This server automatically processes uploaded high-bitrate files into lightweight proxies or professional mezzanine formats, ensuring a smooth non-linear editing (NLE) experience.
+When multiple clients upload the same video with the same profile, the target behavior is to create one canonical transcoding job and return that job ID to duplicate requests.
 
-## 📖 Overview
+> Current status: design documentation only. Implementation will be added in later PRs.
 
-The **Video Digest Server** is built in Rust to leverage memory safety and fearless concurrency. Its primary role is to handle large video uploads from various camera sources, queue them for processing, and encode them based on predefined profiles. 
+## Core Idea
 
-By converting heavy raw files into "proxies," editors can work with low-resolution versions of their footage without straining system resources, later relinking to the original high-resolution files for final render.
+The service deduplicates work by this key:
 
-## ✨ Features
-
-- **Async Processing Pipeline**: Built with `Tokio` to handle multiple simultaneous uploads and encoding jobs.
-- **Dynamic Profile Management**: Switch between "Quick Proxy" and "Professional Mezzanine" formats via configuration.
-- **FFmpeg Integration**: Leverages the power of FFmpeg for industry-standard codec support.
-- **Queue System**: Prevents server saturation by managing transcoding tasks in a priority queue.
-- **Hardware Acceleration**: Supports NVENC/QuickSync (via FFmpeg) for faster encoding.
-
-## 🛠 Build Steps
-
-### Prerequisites
-
-- **Rust**: Install via [rustup](https://rustup.rs/) (`cargo`).
-- **FFmpeg**: Must be installed on the system path with the required codecs enabled.
-  - Linux: `sudo apt install ffmpeg`
-  - macOS: `brew install ffmpeg`
-
-### Installation
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/youruser/video-digest-server.git
-   cd video-digest-server
-   ```
-
-2. Configure environment variables:
-   ```bash
-   cp .env.example .env
-   # Edit .env to set upload directories and port settings
-   ```
-
-3. Build the project:
-   ```bash
-   cargo build --release
-   ```
-
-4. Run the server:
-   ```bash
-   cargo run --release
-   ```
-
-## ⚙️ Encoding Profiles
-
-The server allows you to define profiles in `config.toml`. Depending on the project requirements, you can choose between lightweight web-ready proxies or professional intermediate codecs.
-
-### 1. General Proxy (Fast & Lightweight)
-Designed for remote collaboration and low-spec laptops.
-
-| Feature | Value |
-| :--- | :--- |
-| **Codec** | H.264 / AAC |
-| **Container** | `.mp4` or `.mov` |
-| **Resolution** | 1280x720 (720p) |
-| **Bitrate** | 2-5 Mbps |
-
-### 2. Professional Mezzanine (Edit Ready)
-Designed for high-end post-production houses where visual fidelity and scrubbability are more important than file size.
-
-| Format | Codec | Container | Use Case |
-| :--- | :--- | :--- | :--- |
-| **Apple ProRes** | `prores_ks` | `.mov` | Industry standard for macOS/Final Cut / Premiere |
-| **Avid DNxHD** | `dnxhd` | `.mxf` | Optimized for Avid Media Composer |
-| **CineForm** | `cineform` | `.mov` | High-quality intermediate with alpha support |
-| **APV** | `apv` | `.mov` | Specialized high-efficiency professional format |
-
-## 🚀 Examples
-
-### API Upload Example
-You can trigger a digest job by sending a POST request to the server:
-
-```bash
-curl -X POST http://localhost:8080/upload \
-  -F "video=@/path/to/camera_raw_01.R3D" \
-  -F "profile=prores_proxy"
+```text
+DedupKey = (content_sha256, profile_name)
 ```
 
-### Configuration Example (`config.toml`)
-```toml
-[profiles.web_proxy]
-codec = "libx264"
-container = "mp4"
-resolution = "1280x720"
-crf = 23
+The main concurrency issue is a logical check-then-insert race in an in-memory `HashMap`. This is an application-level race condition, not a Rust memory data race.
 
-[profiles.prores_proxy]
-codec = "prores_ks"
-profile = 1 # ProRes Proxy
-container = "mov"
-resolution = "1920x1080"
+## System Overview
 
-[profiles.avid_dnxhd]
-codec = "dnxhd"
-container = "mxf"
-resolution = "1920x1080"
+```mermaid
+flowchart LR
+    C["Concurrent Clients"] -->|"POST /api/jobs"| API["Axum HTTP API"]
+    API --> U["Upload Stream"]
+    U --> H["Temp File + SHA-256"]
+    H --> R["RegistryState<br/>Arc&lt;Mutex&gt;"]
+    R -->|"new canonical job"| Q["Job Queue"]
+    Q --> W["Worker Pool"]
+    W --> F["FFmpeg"]
+    F --> A["Local Artifact"]
 ```
 
-## 📜 License
+The target service is intentionally small: no database, no authentication, no session management, and no required UI. Runtime job state is kept in memory and is lost on restart.
 
-Distributed under the MIT License. See `LICENSE` for more information.
+## Race Condition
+
+Naive check-then-insert can create duplicate jobs:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Request A
+    participant B as Request B
+    participant R as Dedup HashMap
+
+    A->>R: check key
+    R-->>A: missing
+    B->>R: check same key
+    R-->>B: missing
+    A->>A: create job J1
+    B->>B: create job J2
+    A->>R: insert J1
+    B->>R: insert J2
+```
+
+The planned fix is to perform lookup and insertion inside one mutex-protected critical section:
+
+```mermaid
+flowchart TD
+    L["lock registry"] --> E{"dedup.entry(key)"}
+    E -->|"occupied"| O["return existing job_id"]
+    E -->|"vacant"| N["create job_id"]
+    N --> D["insert dedup entry"]
+    D --> J["insert job metadata"]
+    J --> Q["enqueue canonical job"]
+    O --> U["unlock registry"]
+    Q --> U
+```
+
+The mutex protects registry mutation only. Upload streaming, hashing, FFmpeg execution, and artifact download happen outside the lock.
+
+## Request Flow
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant API as API
+    participant R as Registry
+    participant Q as Queue
+    participant W as Worker
+
+    C->>API: POST /api/jobs
+    API->>API: stream file + compute SHA-256
+    API->>R: lock + get_or_create(DedupKey)
+    alt new key
+        R->>Q: enqueue job
+        R-->>API: deduplicated=false
+    else existing key
+        R-->>API: deduplicated=true
+    end
+    API-->>C: job response
+    Q->>W: dequeue job
+    W->>W: run FFmpeg profile
+```
+
+If an upload is interrupted, the hash is not finalized and no job is registered.
+
+## Job States
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> running
+    running --> succeeded
+    running --> failed
+    succeeded --> [*]
+    failed --> [*]
+```
+
+Invalid transitions are rejected.
+
+## API Surface
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/health` | Health check |
+| `POST` | `/api/jobs` | Upload video and create or reuse a job |
+| `GET` | `/api/jobs` | List recent jobs |
+| `GET` | `/api/jobs/{job_id}` | Read job status |
+| `GET` | `/api/jobs/{job_id}/artifact` | Download succeeded artifact |
+
+## Scope
+
+| In scope | Out of scope |
+|---|---|
+| Rust/Tokio + Axum API | database persistence |
+| multipart uploads | authentication |
+| SHA-256 content hashing | session management |
+| in-memory dedup registry | web dashboard |
+| worker queue | distributed processing |
+| YAML FFmpeg profiles | resumable upload |
+| local filesystem artifacts | runtime profile reload |
+
+## Documentation
+
+- [Architecture](docs/ARCHITECTURE.md)
+- [API specification](docs/API_SPEC.md)
+- [Test plan](docs/TEST_PLAN.md)
