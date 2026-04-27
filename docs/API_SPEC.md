@@ -93,7 +93,7 @@ Success status codes:
 | 201 | New canonical job created |
 | 200 | Existing job returned (`deduplicated=true`) |
 
-Idempotency: for a fixed `(content_sha256, profile_name)`, repeated `POST /api/jobs` calls return the same `job_id` until that job is purged from in-memory state. The first request creates the canonical job with status `queued`; subsequent requests return the same `job_id` along with the canonical job's current status.
+Deduplication property: for a fixed `(content_sha256, profile_name)`, repeated `POST /api/jobs` calls return the same `job_id` until that job is purged from in-memory state. The first request creates the canonical job with status `queued`; subsequent requests return the same `job_id` along with the canonical job's current status.
 
 Errors:
 

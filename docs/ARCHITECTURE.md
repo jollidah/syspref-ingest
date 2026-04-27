@@ -65,7 +65,7 @@ These are target shapes, not final Rust definitions. The important boundary is t
 
 ## Mutex Choice
 
-`tokio::sync::Mutex` is preferred over `std::sync::Mutex` so that a contended `lock().await` yields the executor thread instead of blocking it. The "no `.await` while holding the registry lock" rule still applies — that rule is about avoiding deadlocks and long-tail latency under the lock, not about whether the lock itself is async-aware. With async-aware locking and a strict no-await-under-lock policy, contention only delays other tasks; it never stalls the runtime.
+`tokio::sync::Mutex` is preferred over `std::sync::Mutex` so that a contended `lock().await` does not block the executor thread while waiting for the lock. The "no `.await` while holding the registry lock" rule still applies — that rule is about avoiding deadlocks and long-tail latency under the lock, not about whether the lock itself is async-aware. With async-aware locking and a strict no-await-under-lock policy, contention only delays other tasks rather than blocking executor threads.
 
 ## Registry Critical Section
 
@@ -149,7 +149,7 @@ All other transitions should be rejected.
 | Upload connection dropped mid-stream | No content hash, no dedup entry, no job metadata | Temp file is discarded |
 | Same content uploaded by another client after a previous interrupted attempt | The previous attempt left no registry entry | The new upload becomes the canonical job |
 | FFmpeg exits non-zero | Job transitions `running -> failed` | `Job.error` stores a stderr summary |
-| Worker crash mid-FFmpeg | Job stays in `running` until the process holding it exits | In-memory recovery is out of scope; a server restart clears state |
+| Worker crash mid-FFmpeg | Job may remain `running` | Automatic recovery is out of scope |
 | Server restart | All in-memory `RegistryState` is lost | On-disk inputs and artifacts survive but are not auto-reconciled with the new registry |
 
 These are the design contracts; the implementation must keep them in sync with the test plan.

@@ -128,7 +128,7 @@ If an upload is interrupted, the hash is not finalized and no job is registered.
 | Upload connection dropped mid-stream | Hash is not finalized, no dedup entry, no job registered, temp file discarded |
 | Client A drops mid-upload, then client B uploads the same bytes | A leaves no trace; B's upload computes its own hash and becomes the canonical job |
 | FFmpeg exits non-zero | Job transitions `running -> failed`, `error` field stores a summary |
-| Worker crash mid-FFmpeg | Job remains in `running`; in-memory recovery is out of scope and a server restart resets all state |
+| Worker crash mid-FFmpeg | Job may remain `running`; automatic recovery is out of scope |
 | Server restart | All in-memory job state is lost; uploaded inputs and finished artifacts on disk are not garbage-collected automatically |
 
 ## Job States
