@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum JobStatus {
     #[default]
     Queued,
@@ -12,7 +11,6 @@ pub enum JobStatus {
     Succeeded,
     Failed,
 }
-
 
 #[derive(Debug, Error)]
 pub enum StatusTransitionError {
