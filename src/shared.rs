@@ -4,18 +4,15 @@ use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Default)]
 pub enum JobStatus {
+    #[default]
     Queued,
     Running,
     Succeeded,
     Failed,
 }
 
-impl Default for JobStatus {
-    fn default() -> Self {
-        JobStatus::Queued
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum StatusTransitionError {

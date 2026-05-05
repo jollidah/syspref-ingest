@@ -9,6 +9,12 @@ pub struct JobQueue {
     jobs: HashMap<Uuid, Job>,
 }
 
+impl Default for JobQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JobQueue {
     pub fn new() -> Self {
         JobQueue {

@@ -33,7 +33,7 @@ impl Worker {
 
     pub async fn run(&self) -> AppResult<()> {
         loop {
-            let (job_id, mut job) = match self.queue.lock().await.dequeue().await {
+            let (job_id, job) = match self.queue.lock().await.dequeue().await {
                 Some((jid, j)) => (jid, j),
                 None => continue,
             };
@@ -116,7 +116,7 @@ impl WorkerPool {
     }
 
     pub async fn start(&self) {
-        let workers: Vec<_> = self.workers.iter().cloned().collect();
+        let workers: Vec<_> = self.workers.to_vec();
         for worker in workers {
             tokio::spawn(async move {
                 if let Err(e) = worker.run().await {

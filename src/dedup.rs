@@ -13,6 +13,12 @@ pub struct RegistryState {
     pub jobs: HashMap<Uuid, Job>,
 }
 
+impl Default for RegistryState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RegistryState {
     pub fn new() -> Self {
         RegistryState {

@@ -1,13 +1,12 @@
-use crate::dedup::{RegistryArc, RegistryState};
-use crate::shared::{AppResult, DedupKey, Job};
+use crate::dedup::RegistryArc;
+use crate::shared::{DedupKey, Job};
 use crate::storage::Storage;
 use axum::{
     extract::multipart::Multipart,
     extract::{Path, State},
     http::StatusCode,
     response::Json,
-    routing::{get, post},
-    Json as AxumJson, Router,
+    routing::{get, post}, Router,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
