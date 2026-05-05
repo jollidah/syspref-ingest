@@ -6,7 +6,8 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::Json,
-    routing::{get, post}, Router,
+    routing::{get, post},
+    Router,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -15,6 +16,7 @@ use tokio::fs;
 pub struct AppState {
     pub registry: RegistryArc,
     pub storage: Arc<Storage>,
+    pub queue: QueueArc,
 }
 
 impl Clone for AppState {
@@ -212,8 +214,12 @@ pub async fn get_artifact(
     }
 }
 
-pub fn create_router(registry: RegistryArc, storage: Arc<Storage>) -> Router {
-    let state = AppState { registry, storage };
+pub fn create_router(registry: RegistryArc, storage: Arc<Storage>, queue: QueueArc) -> Router {
+    let state = AppState {
+        registry,
+        storage,
+        queue,
+    };
 
     Router::new()
         .route("/api/health", get(health))

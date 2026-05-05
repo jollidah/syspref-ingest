@@ -82,7 +82,8 @@ async fn main() -> Result<()> {
     worker_pool.start().await;
 
     // Create router
-    let app = api::create_router(registry, storage.clone()).layer(TraceLayer::new_for_http());
+    let app = api::create_router(registry, storage.clone(), queue.clone())
+        .layer(TraceLayer::new_for_http());
 
     // Start server
     let addr = config.bind.parse::<std::net::SocketAddr>()?;
