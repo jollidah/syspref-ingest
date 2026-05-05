@@ -24,11 +24,17 @@ impl Storage {
     }
 
     pub fn job_input_path(&self, job_id: &Uuid) -> PathBuf {
-        self.base_path.join("jobs").join(job_id.to_string()).join("input")
+        self.base_path
+            .join("jobs")
+            .join(job_id.to_string())
+            .join("input")
     }
 
     pub fn job_output_path(&self, job_id: &Uuid) -> PathBuf {
-        self.base_path.join("jobs").join(job_id.to_string()).join("output")
+        self.base_path
+            .join("jobs")
+            .join(job_id.to_string())
+            .join("output")
     }
 
     pub fn create_job_dirs(&self, job_id: &Uuid) -> Result<()> {

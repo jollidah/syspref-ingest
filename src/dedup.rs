@@ -23,11 +23,7 @@ impl RegistryState {
 
     /// Atomic get-or-create operation under lock.
     /// Returns (job_id, was_deduplicated).
-    pub async fn get_or_create(
-        &mut self,
-        key: DedupKey,
-        profile: String,
-    ) -> (Uuid, bool) {
+    pub async fn get_or_create(&mut self, key: DedupKey, profile: String) -> (Uuid, bool) {
         let job_id = Uuid::new_v4();
 
         // Check if we have an existing job with same content_hash
@@ -103,8 +99,7 @@ mod tests {
         // Exactly one should have dedup=false, rest should be true
         let false_count = dedup_flags.iter().filter(|&&x| !x).count();
         assert_eq!(
-            false_count,
-            1,
+            false_count, 1,
             "Exactly one job should be newly created (dedup=false)"
         );
 

@@ -47,8 +47,9 @@ impl FfmpegRunner {
         let status = tokio::task::spawn_blocking(move || {
             let mut c = child;
             c.wait()
-        }).await??;
-        
+        })
+        .await??;
+
         if status.success() {
             Ok(())
         } else {

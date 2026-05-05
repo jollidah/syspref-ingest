@@ -1,5 +1,5 @@
 use crate::dedup::RegistryArc;
-use crate::ffmpeg::{FfmpegRunner};
+use crate::ffmpeg::FfmpegRunner;
 use crate::queue::QueueArc;
 use crate::shared::AppResult;
 use crate::storage::Storage;
@@ -102,7 +102,13 @@ impl WorkerPool {
     ) -> Self {
         let workers = (0..size)
             .map(|id| {
-                Worker::new(id, registry.clone(), queue.clone(), ffmpeg_runner.clone(), storage.clone())
+                Worker::new(
+                    id,
+                    registry.clone(),
+                    queue.clone(),
+                    ffmpeg_runner.clone(),
+                    storage.clone(),
+                )
             })
             .collect();
 
