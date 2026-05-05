@@ -1,4 +1,5 @@
 use crate::dedup::RegistryArc;
+use crate::queue::QueueArc;
 use crate::shared::{DedupKey, Job};
 use crate::storage::Storage;
 use axum::{
@@ -24,6 +25,7 @@ impl Clone for AppState {
         AppState {
             registry: Arc::clone(&self.registry),
             storage: self.storage.clone(),
+            queue: Arc::clone(&self.queue),
         }
     }
 }
