@@ -120,7 +120,10 @@ Errors:
 | 400 | `missing_file` | multipart request has no `file` field |
 | 400 | `missing_profile` | multipart request has no `profile` field |
 | 400 | `unknown_profile` | profile name is not configured |
-| 413 | `payload_too_large` | uploaded body exceeds the configured maximum size |
+| 400 | `invalid_multipart` | multipart wire-protocol parse failure: missing or invalid `boundary`, non-multipart `Content-Type`, truncated body, multipart header parse error, or invalid UTF-8 in the `profile` field |
+| 413 | `payload_too_large` | encoded multipart body exceeds the configured maximum size |
+
+The `payload_too_large` limit is applied to the entire encoded multipart body — boundary delimiters, part headers, and file bytes summed — not to the raw file contents alone. The limit is configured per-request via the `--max-upload-bytes` CLI flag and is not a concurrency cap.
 
 If the client disconnects before upload completion, the server may not be able to send a response. The server-side behavior is still defined: no content hash is finalized, no job metadata is inserted, and no job is enqueued.
 
