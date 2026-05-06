@@ -25,7 +25,7 @@ impl Clone for AppState {
         AppState {
             registry: Arc::clone(&self.registry),
             storage: self.storage.clone(),
-            queue: Arc::clone(&self.queue),
+            queue: self.queue.clone(),
         }
     }
 }

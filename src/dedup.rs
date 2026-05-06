@@ -8,16 +8,17 @@ pub struct DedupEntry {
     pub job_id: Uuid,
 }
 
+#[derive(Default)]
 pub struct RegistryState {
     pub dedup: HashMap<DedupKey, DedupEntry>,
     pub jobs: HashMap<Uuid, Job>,
 }
 
-impl Default for RegistryState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// impl Default for RegistryState {
+//     fn default() -> Self {
+//         Self::new()
+//     }
+// }
 
 impl RegistryState {
     pub fn new() -> Self {
