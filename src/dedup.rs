@@ -24,11 +24,7 @@ impl RegistryState {
 
     /// Atomic get-or-create operation under lock.
     /// Returns (job_id, was_deduplicated).
-    pub fn get_or_create(
-        &mut self,
-        key: DedupKey,
-        profile: String,
-    ) -> (Uuid, bool) {
+    pub fn get_or_create(&mut self, key: DedupKey, profile: String) -> (Uuid, bool) {
         let job_id = Uuid::new_v4();
 
         // Check if we have an existing job with same content_hash
