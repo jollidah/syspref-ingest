@@ -68,21 +68,21 @@ async fn main() -> Result<()> {
 
     // Initialize shared state
     let registry: RegistryArc = create_registry();
-    let queue = create_queue();
+    let (queue_tx, queue_rx) = create_queue();
     let storage = std::sync::Arc::new(storage);
 
-    // Start worker pool
+    // Start worker pool (consumers share the receiver via Arc<Mutex<_>>)
     let worker_pool = worker::WorkerPool::new(
         4,
         registry.clone(),
-        queue.clone(),
+        queue_rx.clone(),
         ffmpeg_runner,
         storage.clone(),
     );
     worker_pool.start().await;
 
-    // Create router
-    let app = api::create_router(registry, storage.clone(), queue.clone())
+    // Create router (producer side holds the sender)
+    let app = api::create_router(registry, storage.clone(), queue_tx)
         .layer(TraceLayer::new_for_http());
 
     // Start server

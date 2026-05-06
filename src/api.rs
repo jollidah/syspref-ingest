@@ -1,5 +1,5 @@
 use crate::dedup::RegistryArc;
-use crate::queue::QueueArc;
+use crate::queue::JobSender;
 use crate::shared::{DedupKey, Job};
 use crate::storage::Storage;
 use axum::{
@@ -17,7 +17,7 @@ use tokio::fs;
 pub struct AppState {
     pub registry: RegistryArc,
     pub storage: Arc<Storage>,
-    pub queue: QueueArc,
+    pub queue_tx: JobSender,
 }
 
 impl Clone for AppState {
@@ -25,7 +25,7 @@ impl Clone for AppState {
         AppState {
             registry: Arc::clone(&self.registry),
             storage: self.storage.clone(),
-            queue: self.queue.clone(),
+            queue_tx: self.queue_tx.clone(),
         }
     }
 }
@@ -98,16 +98,60 @@ pub async fn create_job(
     // Create DedupKey
     let key = DedupKey::new(content_hash.clone(), profile.clone());
 
-    // Get or create job under lock
+    // Atomic dedup lookup/insert. Synchronous body — no `.await` while holding
+    // the registry guard (docs/ARCHITECTURE.md, docs/TEST_PLAN.md).
     let profile_for_response = profile.clone();
     let (job_id, deduplicated) = {
         let mut registry = state.registry.lock().await;
-        registry.get_or_create(key, profile).await
+        registry.get_or_create(key.clone(), profile)
     };
 
-    // Cleanup temp file
-    if let Err(e) = state.storage.cleanup_tmp(&filename) {
-        eprintln!("Failed to cleanup temp file: {}", e);
+    if deduplicated {
+        // Existing canonical job: discard tmp, do not enqueue.
+        state.storage.cleanup_tmp(&filename).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to cleanup tmp: {}", e),
+            )
+        })?;
+    } else {
+        // New canonical job: stage tmp -> canonical input, then enqueue.
+        // Order: create_job_dirs -> rename -> send. If any step fails after
+        // the registry insert, roll back the dedup/jobs entries so future
+        // requests for the same key can produce a fresh canonical job
+        // (docs/API_SPEC.md: "creates one canonical job and enqueues it").
+        let canonical_path = state.storage.job_input_path(&job_id).join("input.bin");
+        let tmp_path = state.storage.tmp_path(&filename);
+
+        let staging: Result<(), String> = async {
+            state
+                .storage
+                .create_job_dirs(&job_id)
+                .map_err(|e| format!("create_job_dirs: {}", e))?;
+            fs::rename(&tmp_path, &canonical_path)
+                .await
+                .map_err(|e| format!("rename: {}", e))?;
+            state
+                .queue_tx
+                .send(job_id)
+                .map_err(|e| format!("queue send: {}", e))?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = staging {
+            {
+                let mut registry = state.registry.lock().await;
+                registry.remove(&key, &job_id);
+            }
+            // Best-effort tmp cleanup. Ignore errors (tmp may already be
+            // gone if rename succeeded before a later step failed).
+            let _ = state.storage.cleanup_tmp(&filename);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("staging failed: {}", e),
+            ));
+        }
     }
 
     let response = serde_json::json!({
@@ -216,11 +260,15 @@ pub async fn get_artifact(
     }
 }
 
-pub fn create_router(registry: RegistryArc, storage: Arc<Storage>, queue: QueueArc) -> Router {
+pub fn create_router(
+    registry: RegistryArc,
+    storage: Arc<Storage>,
+    queue_tx: JobSender,
+) -> Router {
     let state = AppState {
         registry,
         storage,
-        queue,
+        queue_tx,
     };
 
     Router::new()
