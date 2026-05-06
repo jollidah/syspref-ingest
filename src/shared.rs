@@ -28,6 +28,7 @@ impl JobStatus {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_terminal(&self) -> bool {
         matches!(self, JobStatus::Succeeded | JobStatus::Failed)
     }
@@ -196,6 +197,7 @@ impl Job {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("Job not found: {0}")]
