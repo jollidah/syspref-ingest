@@ -188,7 +188,7 @@ See [API specification](docs/API_SPEC.md#profile-configuration) for the full sch
 
 `POST /api/jobs` rejects requests whose encoded multipart body exceeds `--max-upload-bytes` (default 50 MiB) with a `413 payload_too_large` envelope. The limit applies to the entire encoded body, including boundary delimiters and part headers, not just the file contents.
 
-`--max-upload-bytes` is a per-request cap; it does not bound the number of concurrent uploads. With the current buffered upload path each in-flight request can hold up to the limit in memory, so concurrent traffic should be sized accordingly. True streaming with bounded memory is tracked by the streaming follow-up issue.
+`--max-upload-bytes` is a per-request cap; it does not bound the number of concurrent uploads. The upload path streams the request body to a temp file while computing SHA-256 incrementally (Issue #10), so per-request memory is bounded by the multipart parser's chunk size rather than by `--max-upload-bytes`. Concurrent traffic should therefore be sized against tmp-directory disk bandwidth and capacity, not against memory.
 
 ## Out of Scope
 

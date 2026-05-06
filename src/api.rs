@@ -13,8 +13,10 @@ use axum::{
     Router,
 };
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 /// Map a `MultipartError` raised during field iteration to the corresponding
@@ -26,6 +28,19 @@ fn map_multipart_err(err: MultipartError) -> AppError {
         AppError::PayloadTooLarge
     } else {
         AppError::InvalidMultipart
+    }
+}
+
+/// RAII guard: always removes the tracked tmp path on Drop. `remove_file`
+/// errors (ENOENT after `fs::rename`, after explicit `cleanup_tmp`, or when
+/// `File::create` failed before any bytes were written) are absorbed.
+/// Satisfies docs/ARCHITECTURE.md "Upload connection dropped mid-stream →
+/// Temp file is discarded".
+struct TmpFileGuard(PathBuf);
+
+impl Drop for TmpFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -71,59 +86,55 @@ pub async fn create_job(
 
     let mut file_data: Option<(String, String)> = None;
     let mut profile_str: Option<String> = None;
+    // Request-scoped guard: armed when the file branch starts writing tmp,
+    // disarmed only after the file is committed (renamed to canonical on
+    // dedup-miss or explicit cleanup_tmp on dedup-hit). Any early return,
+    // panic, or future cancellation between arm and commit triggers Drop,
+    // which sync-removes the tmp file.
+    let mut tmp_guard: Option<TmpFileGuard> = None;
 
-    while let Some(field) = multipart.next_field().await.map_err(map_multipart_err)? {
+    while let Some(mut field) = multipart.next_field().await.map_err(map_multipart_err)? {
         let name = field.name().unwrap_or("").to_string();
-        let bytes: Bytes = field.bytes().await.map_err(map_multipart_err)?;
 
         if name == "file" {
-            let mut hasher = Sha256::new();
-            hasher.update(&bytes);
-            let hash = hex::encode(hasher.finalize());
-
+            // docs/API_SPEC.md: "The server streams the file to a temporary
+            // path. The server computes SHA-256 while reading the stream."
+            // `Option::replace` returns the previous guard, which is dropped
+            // here, cleaning up the earlier tmp if a duplicate `file` field
+            // arrives.
             let filename = format!("upload_{}.tmp", uuid::Uuid::new_v4());
             let tmp_path = state.storage.tmp_path(&filename);
-            fs::write(&tmp_path, &bytes).await?;
+            tmp_guard.replace(TmpFileGuard(tmp_path.clone()));
 
+            let mut hasher = Sha256::new();
+            {
+                let mut file = tokio::fs::File::create(&tmp_path).await?;
+                while let Some(chunk) = field.chunk().await.map_err(map_multipart_err)? {
+                    hasher.update(&chunk);
+                    file.write_all(&chunk).await?;
+                }
+                file.flush().await?;
+            }
+            let hash = hex::encode(hasher.finalize());
             file_data = Some((hash, filename));
         } else if name == "profile" {
-            // Wire/encoding-level violation -> invalid_multipart, distinct
-            // from the structural missing_profile case (= valid multipart
-            // with no `profile` field at all). Clean up any tmp the `file`
-            // branch already staged before returning, since this PR owns
-            // this new error path.
-            profile_str = Some(match String::from_utf8(bytes.to_vec()) {
-                Ok(s) => s,
-                Err(_) => {
-                    if let Some((_, prev_filename)) = &file_data {
-                        let _ = state.storage.cleanup_tmp(prev_filename);
-                    }
-                    return Err(AppError::InvalidMultipart);
-                }
-            });
+            let bytes: Bytes = field.bytes().await.map_err(map_multipart_err)?;
+            let p = String::from_utf8(bytes.to_vec()).map_err(|_| AppError::InvalidMultipart)?;
+            // Option A (plan §4-A T4 / D6): validate at parse time so a
+            // profile-first request with an invalid name skips file IO.
+            if state.transcoder.get_profile(&p).is_none() {
+                return Err(AppError::UnknownProfile(p));
+            }
+            profile_str = Some(p);
         }
+        // Unknown field names: drop the `Field` without reading. multer
+        // skips its remaining bytes when `next_field()` is called next.
     }
 
     let (content_hash, filename) = file_data.ok_or(AppError::MissingFile)?;
-
-    // From here on the file has been staged to tmp, so the validation
-    // failures introduced by this PR (`missing_profile` after a file field,
-    // `unknown_profile`) clean it up explicitly before returning.
-    let profile = match profile_str {
-        Some(p) => p,
-        None => {
-            let _ = state.storage.cleanup_tmp(&filename);
-            return Err(AppError::MissingProfile);
-        }
-    };
-
-    // Synchronous, lock-free profile validation. `Transcoder::get_profile`
-    // is sync, so this satisfies the "no `.await` while holding the registry
-    // lock" rule trivially — we validate before taking the registry lock.
-    if state.transcoder.get_profile(&profile).is_none() {
-        let _ = state.storage.cleanup_tmp(&filename);
-        return Err(AppError::UnknownProfile(profile));
-    }
+    // Profile was already validated at parse time (Option A); on missing,
+    // the guard cleans up the staged tmp via Drop on early return.
+    let profile = profile_str.ok_or(AppError::MissingProfile)?;
 
     let key = DedupKey::new(content_hash.clone(), profile.clone());
     let profile_for_response = profile.clone();
@@ -136,7 +147,9 @@ pub async fn create_job(
     };
 
     if deduplicated {
-        // Existing canonical job: discard tmp, do not enqueue.
+        // Existing canonical job: discard tmp, do not enqueue. Surface
+        // cleanup errors here; the guard's Drop on function return is a
+        // best-effort fallback (ENOENT-safe).
         if let Err(e) = state.storage.cleanup_tmp(&filename) {
             return Err(AppError::StorageError(format!("cleanup_tmp: {}", e)));
         }
@@ -169,9 +182,13 @@ pub async fn create_job(
                 let mut registry = state.registry.lock().await;
                 registry.remove(&key, &job_id);
             }
+            // Best-effort cleanup; guard's Drop is also ENOENT-safe if
+            // rename already moved the tmp.
             let _ = state.storage.cleanup_tmp(&filename);
             return Err(AppError::StorageError(format!("staging failed: {}", e)));
         }
+        // Staging succeeded: rename moved tmp to canonical. The guard's
+        // Drop on function return will see ENOENT and absorb it.
     }
 
     // Spec: 201 for new canonical job, 200 for dedup hit. `dedup_status` is
@@ -565,7 +582,280 @@ mod tests {
         assert_eq!(body["status"], "queued");
         assert_eq!(body["profile"], "p");
         assert!(body["job_id"].as_str().is_some());
-        assert!(body["content_hash"].as_str().is_some());
+        // Issue #10 regression: content_hash matches the known SHA-256 of
+        // "hello world" (b94d27b9...). Asserting the exact hex catches any
+        // chunk-loop bug that the previous `is_some()` check would have
+        // masked.
+        assert_eq!(
+            body["content_hash"],
+            "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    /// Issue #10: streamed SHA-256 of an empty file equals the well-known
+    /// digest of zero bytes. Proves the chunk loop produces a valid hash
+    /// even when `field.chunk()` yields no data.
+    #[tokio::test]
+    async fn post_empty_file_yields_known_empty_sha256() {
+        let (app, _registry, _storage, _queue_rx) = router();
+        let boundary = "BNDRY";
+        let body = multipart_body(boundary, b"", "p");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, body) = read_json(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(
+            body["content_hash"],
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// Issue #10: chunked hashing produces the same digest as one-shot
+    /// hashing on a payload large enough to typically span multiple
+    /// `field.chunk()` calls. Uses a generous body limit so the streaming
+    /// path is exercised end-to-end.
+    #[tokio::test]
+    async fn streamed_hash_matches_one_shot_for_multi_chunk_payload() {
+        let (app, _registry, _storage, _queue_rx) = router_with_limit(8 * 1024 * 1024);
+        // Deterministic, non-trivial 256 KiB payload.
+        let payload: Vec<u8> = (0..(256 * 1024) as u32).map(|i| (i % 251) as u8).collect();
+        let mut hasher = Sha256::new();
+        hasher.update(&payload);
+        let expected = hex::encode(hasher.finalize());
+
+        let boundary = "BNDRY";
+        let body = multipart_body(boundary, &payload, "p");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, body) = read_json(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(body["content_hash"], expected);
+    }
+
+    /// Issue #10 / plan §6 E4: when the request body errors mid-stream after
+    /// the file branch has started writing, the handler must return without
+    /// leaving a partial tmp on disk and without inserting any registry or
+    /// queue state. Exercises `TmpFileGuard`'s Drop on the early-return path.
+    #[tokio::test]
+    async fn mid_stream_body_error_clears_tmp_and_state() {
+        use futures::stream;
+        let (app, registry, storage, queue_rx) = router();
+        let boundary = "BNDRY";
+        // Multipart prologue + file headers + a few bytes of body, then an
+        // unrecoverable stream error. The multipart parser surfaces this as
+        // a `MultipartError`, which `map_multipart_err` maps to
+        // `AppError::InvalidMultipart`.
+        let prologue = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"v.mp4\"\r\n\r\n"
+        );
+        let chunks: Vec<Result<axum::body::Bytes, std::io::Error>> = vec![
+            Ok(axum::body::Bytes::from(prologue.into_bytes())),
+            Ok(axum::body::Bytes::from_static(b"hello mid-stream")),
+            Err(std::io::Error::other("simulated client disconnect")),
+        ];
+        let body = axum::body::Body::from_stream(stream::iter(chunks));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(body)
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, json) = read_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "invalid_multipart");
+
+        // Registry and queue must be untouched.
+        let registry_state = registry.lock().await;
+        assert!(registry_state.dedup.is_empty());
+        assert!(registry_state.jobs.is_empty());
+        drop(registry_state);
+        assert!(queue_rx.lock().await.try_recv().is_err());
+
+        // tmp dir must hold no partial upload file (guard's Drop ran).
+        let tmp_dir = storage.tmp_path("");
+        let tmp_dir = tmp_dir.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(tmp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("upload_"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp leftovers: {:?}", leftovers);
+    }
+
+    /// Issue #10 / plan §6 E12a: with Option A profile validation, an unknown
+    /// `profile` field arriving BEFORE the `file` field short-circuits before
+    /// any file IO happens. Asserts the response envelope, empty registry/
+    /// queue, AND the absence of any `upload_*.tmp` file (the file branch
+    /// must not have run).
+    #[tokio::test]
+    async fn unknown_profile_first_skips_file_io() {
+        let (app, registry, storage, queue_rx) = router();
+        let boundary = "BNDRY";
+        // profile FIRST (so Option A's parse-time validation fires before
+        // the file branch is reached), then file.
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"profile\"\r\n\r\n");
+        body.extend_from_slice(b"does_not_exist");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"v.mp4\"\r\n\r\n",
+        );
+        body.extend_from_slice(b"would-be file content");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, json) = read_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "unknown_profile");
+
+        let registry_state = registry.lock().await;
+        assert!(registry_state.dedup.is_empty());
+        assert!(registry_state.jobs.is_empty());
+        drop(registry_state);
+        assert!(queue_rx.lock().await.try_recv().is_err());
+
+        // tmp dir must be clean — proves the file branch never ran (no IO
+        // wasted on staging the file before the unknown_profile check).
+        let tmp_dir = storage.tmp_path("");
+        let tmp_dir = tmp_dir.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(tmp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("upload_"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp leftovers: {:?}", leftovers);
+    }
+
+    /// Issue #10 / plan §6 E11: a duplicate `file` field is processed with
+    /// last-wins semantics. The first tmp must be cleaned up by the prior
+    /// guard's Drop, the canonical hash/content come from the LAST file
+    /// field, and only one canonical input is committed.
+    #[tokio::test]
+    async fn duplicate_file_field_last_wins_and_clears_first_tmp() {
+        let (app, _registry, storage, _queue_rx) = router();
+        let boundary = "BNDRY";
+        let first_payload = b"FIRST file content";
+        let last_payload = b"LAST file content";
+        let mut body = Vec::new();
+        for payload in &[first_payload.as_slice(), last_payload.as_slice()] {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(
+                b"Content-Disposition: form-data; name=\"file\"; filename=\"v.mp4\"\r\n\r\n",
+            );
+            body.extend_from_slice(payload);
+            body.extend_from_slice(b"\r\n");
+        }
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"profile\"\r\n\r\n");
+        body.extend_from_slice(b"p");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, response_body) = read_json(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        // Last-wins: hash comes from the second (last) `file` field.
+        let mut hasher = Sha256::new();
+        hasher.update(last_payload);
+        let expected = hex::encode(hasher.finalize());
+        assert_eq!(response_body["content_hash"], expected);
+
+        // Canonical input.bin contains the LAST payload (not the first).
+        let job_id = uuid::Uuid::parse_str(response_body["job_id"].as_str().unwrap()).unwrap();
+        let canonical = storage.job_input_path(&job_id).join("input.bin");
+        let canonical_bytes = std::fs::read(&canonical).expect("canonical input present");
+        assert_eq!(canonical_bytes.as_slice(), last_payload);
+
+        // No `upload_*.tmp` left behind: the first tmp was cleaned by the
+        // prior guard's Drop when the second `file` field arrived.
+        let tmp_dir = storage.tmp_path("");
+        let tmp_dir = tmp_dir.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(tmp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("upload_"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp leftovers: {:?}", leftovers);
+    }
+
+    /// Issue #10: a successful upload commits the canonical input under
+    /// `jobs/<id>/input/input.bin` with byte-identical content and leaves
+    /// no `upload_*.tmp` behind. Catches regressions where the streaming
+    /// path forgets to rename or leaves the tmp.
+    #[tokio::test]
+    async fn streamed_upload_commits_canonical_and_clears_tmp() {
+        let (app, _registry, storage, _queue_rx) = router();
+        let payload = b"streaming committal check";
+        let boundary = "BNDRY";
+        let body = multipart_body(boundary, payload, "p");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, body) = read_json(resp).await;
+        assert_eq!(status, StatusCode::CREATED);
+
+        let job_id = uuid::Uuid::parse_str(body["job_id"].as_str().unwrap()).unwrap();
+        let canonical = storage.job_input_path(&job_id).join("input.bin");
+        let canonical_bytes = std::fs::read(&canonical).expect("canonical input present");
+        assert_eq!(canonical_bytes.as_slice(), payload);
+
+        let tmp_dir = storage.tmp_path("");
+        let tmp_dir = tmp_dir.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(tmp_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("upload_"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp leftovers: {:?}", leftovers);
     }
 
     #[tokio::test]
