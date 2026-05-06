@@ -15,7 +15,7 @@ use queue::create_queue;
 use std::fs;
 use std::path::Path;
 use storage::Storage;
-use tower_http::trace::{TraceLayer};
+use tower_http::trace::TraceLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -28,17 +28,23 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::load()?;
-    
+
     // Initialize storage
     let storage = Storage::new(&config.data_dir);
     storage.ensure_exists()?;
 
     // Load FFmpeg profiles from YAML
-    let profiles_path = config.profiles_path.as_deref().unwrap_or(Path::new("profiles.yaml"));
+    let profiles_path = config
+        .profiles_path
+        .as_deref()
+        .unwrap_or(Path::new("profiles.yaml"));
     let profiles_yaml = if profiles_path.exists() {
         fs::read_to_string(profiles_path)?
     } else {
-        eprintln!("Profiles file not found at {:?}, using defaults", profiles_path);
+        eprintln!(
+            "Profiles file not found at {:?}, using defaults",
+            profiles_path
+        );
         String::new()
     };
 

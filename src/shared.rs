@@ -3,18 +3,13 @@ use std::path::PathBuf;
 use thiserror::Error;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum JobStatus {
+    #[default]
     Queued,
     Running,
     Succeeded,
     Failed,
-}
-
-impl Default for JobStatus {
-    fn default() -> Self {
-        JobStatus::Queued
-    }
 }
 
 #[derive(Debug, Error)]
@@ -46,12 +41,12 @@ mod tests {
     fn invalid_status_transition() {
         // Test all invalid transitions
         let invalid_transitions = vec![
-            (JobStatus::Queued, JobStatus::Queued),  // queued -> queued
+            (JobStatus::Queued, JobStatus::Queued),     // queued -> queued
             (JobStatus::Queued, JobStatus::Succeeded),  // queued -> succeeded
-            (JobStatus::Queued, JobStatus::Failed),  // queued -> failed
-            (JobStatus::Running, JobStatus::Running),  // running -> running
-            (JobStatus::Succeeded, JobStatus::Running),  // succeeded -> running
-            (JobStatus::Failed, JobStatus::Running),  // failed -> running
+            (JobStatus::Queued, JobStatus::Failed),     // queued -> failed
+            (JobStatus::Running, JobStatus::Running),   // running -> running
+            (JobStatus::Succeeded, JobStatus::Running), // succeeded -> running
+            (JobStatus::Failed, JobStatus::Running),    // failed -> running
         ];
 
         for (from, to) in invalid_transitions {
@@ -135,7 +130,10 @@ pub struct DedupKey {
 
 impl DedupKey {
     pub fn new(content_hash: String, profile: String) -> Self {
-        DedupKey { content_hash, profile }
+        DedupKey {
+            content_hash,
+            profile,
+        }
     }
 }
 
@@ -183,7 +181,9 @@ impl Job {
         self.status.can_transition_to(JobStatus::Succeeded)?;
         self.status = JobStatus::Succeeded;
         self.finished_at = Some(chrono::Utc::now());
-        self.artifact = Some(Artifact { path: artifact_path });
+        self.artifact = Some(Artifact {
+            path: artifact_path,
+        });
         Ok(())
     }
 

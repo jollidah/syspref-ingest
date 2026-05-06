@@ -42,14 +42,20 @@ pub async fn create_job(
     let mut profile_str: Option<String> = None;
 
     while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Failed to read field: {}", e))
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Failed to read field: {}", e),
+        )
     })? {
         let name = field.name().unwrap_or("").to_string();
 
         // Read the bytes using axum's Bytes
         use axum::body::Bytes;
         let bytes: Bytes = field.bytes().await.map_err(|e| {
-            (StatusCode::BAD_REQUEST, format!("Failed to read bytes: {}", e))
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read bytes: {}", e),
+            )
         })?;
 
         if name == "file" {
@@ -62,14 +68,20 @@ pub async fn create_job(
             let filename = format!("upload_{}.tmp", uuid::Uuid::new_v4());
             let tmp_path = state.storage.tmp_path(&filename);
 
-            fs::write(&tmp_path, &bytes)
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to write file: {}", e)))?;
+            fs::write(&tmp_path, &bytes).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to write file: {}", e),
+                )
+            })?;
 
             file_data = Some((hash, filename));
         } else if name == "profile" {
             profile_str = Some(String::from_utf8(bytes.to_vec()).map_err(|e| {
-                (StatusCode::BAD_REQUEST, format!("Invalid UTF-8 in profile: {}", e))
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid UTF-8 in profile: {}", e),
+                )
             })?);
         }
     }
@@ -188,17 +200,19 @@ pub async fn list_jobs(State(state): State<AppState>) -> Json<serde_json::Value>
 
     let job_list: Vec<serde_json::Value> = jobs
         .iter()
-        .map(|j| serde_json::json!({
-            "job_id": j.job_id.to_string(),
-            "status": match j.status {
-                crate::shared::JobStatus::Queued => "queued",
-                crate::shared::JobStatus::Running => "running",
-                crate::shared::JobStatus::Succeeded => "succeeded",
-                crate::shared::JobStatus::Failed => "failed",
-            },
-            "profile": j.profile,
-            "content_hash": j.content_hash
-        }))
+        .map(|j| {
+            serde_json::json!({
+                "job_id": j.job_id.to_string(),
+                "status": match j.status {
+                    crate::shared::JobStatus::Queued => "queued",
+                    crate::shared::JobStatus::Running => "running",
+                    crate::shared::JobStatus::Succeeded => "succeeded",
+                    crate::shared::JobStatus::Failed => "failed",
+                },
+                "profile": j.profile,
+                "content_hash": j.content_hash
+            })
+        })
         .collect();
 
     Json(serde_json::json!({ "jobs": job_list }))
@@ -219,24 +233,30 @@ pub async fn get_artifact(
                 match fs::read(&artifact.path).await {
                     Ok(bytes) => {
                         let mime_str = "video/mp4";
-                        let mime: mime::Mime = mime_str.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
+                        let mime: mime::Mime =
+                            mime_str.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
                         Ok(axum::response::Response::builder()
                             .header("Content-Type", mime.to_string())
                             .body(bytes.into())
                             .unwrap())
                     }
-                    Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to read artifact: {}", e))),
+                    Err(e) => Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to read artifact: {}", e),
+                    )),
                 }
             } else {
                 Err((StatusCode::NOT_FOUND, "Artifact not found".to_string()))
             }
         }
-        crate::shared::JobStatus::Queued | crate::shared::JobStatus::Running => {
-            Err((StatusCode::SERVICE_UNAVAILABLE, "Job not completed yet".to_string()))
-        }
-        crate::shared::JobStatus::Failed => {
-            Err((StatusCode::BAD_GATEWAY, format!("Job failed: {:?}", job.error)))
-        }
+        crate::shared::JobStatus::Queued | crate::shared::JobStatus::Running => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Job not completed yet".to_string(),
+        )),
+        crate::shared::JobStatus::Failed => Err((
+            StatusCode::BAD_GATEWAY,
+            format!("Job failed: {:?}", job.error),
+        )),
     }
 }
 

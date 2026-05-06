@@ -133,7 +133,7 @@ impl WorkerPool {
     }
 
     pub async fn start(&self) {
-        let workers: Vec<_> = self.workers.iter().cloned().collect();
+        let workers: Vec<_> = self.workers.to_vec();
         for worker in workers {
             tokio::spawn(async move {
                 if let Err(e) = worker.run().await {
