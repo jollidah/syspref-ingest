@@ -23,7 +23,7 @@ impl RegistryState {
 
     /// Atomic get-or-create operation under lock.
     /// Returns (job_id, was_deduplicated).
-    pub async fn get_or_create(
+    pub fn get_or_create(
         &mut self,
         key: DedupKey,
         profile: String,
@@ -43,6 +43,17 @@ impl RegistryState {
         self.dedup.insert(key, DedupEntry { job_id });
 
         (job_id, false)
+    }
+
+    /// Roll back a freshly created (key, job_id) when staging or enqueue fails
+    /// before the job becomes effective. Idempotent. The dedup entry is only
+    /// removed if it still points at the same job_id (another canonical job
+    /// may have replaced it under contention; do not clobber that).
+    pub fn remove(&mut self, key: &DedupKey, job_id: &Uuid) {
+        if matches!(self.dedup.get(key), Some(entry) if entry.job_id == *job_id) {
+            self.dedup.remove(key);
+        }
+        self.jobs.remove(job_id);
     }
 
     pub fn get_job(&self, job_id: &Uuid) -> Option<&Job> {

@@ -19,7 +19,7 @@ async fn dedup_registry_concurrent_access() {
         handles.push(tokio::spawn(async move {
             barrier.wait().await;
             let mut r = reg.lock().await;
-            r.get_or_create(key, "p".into()).await
+            r.get_or_create(key, "p".into())
         }));
     }
 
