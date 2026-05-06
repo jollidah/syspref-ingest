@@ -14,6 +14,24 @@ Clients send only a profile name, for example `web_720p`.
 
 Raw FFmpeg arguments from clients are not accepted. FFmpeg arguments are loaded from server-side YAML profile configuration.
 
+### Profile Configuration
+
+Profiles are loaded at startup from `profiles.yaml` at the repository root (overridable via `--profiles-path`). When the file is absent, the server falls back to built-in profiles (`web_720p`, `web_480p`, both `mp4`).
+
+Each profile entry has the following shape:
+
+```yaml
+- name: web_720p
+  args: ["-vf", "scale=1280:720"]
+  output_extension: mp4
+```
+
+| Field | Type | Required | Default | Notes |
+|---|---|---|---|---|
+| `name` | string | yes | — | Profile identifier sent by clients. |
+| `args` | array of strings | yes | — | FFmpeg arguments inserted between input and output paths. |
+| `output_extension` | string | no | `"mp4"` | Used both as the worker output filename `proxy.{output_extension}` and the artifact download filename `{job_id}.{output_extension}`. Must match `^[a-z0-9]{1,8}$` — no leading dot, no uppercase, no slashes, no whitespace, non-empty. The server fails to start if any profile violates this constraint. |
+
 ## Error Shape
 
 Error responses use a stable JSON shape:
@@ -120,7 +138,7 @@ Response:
   "started_at": "2026-04-27T00:00:01Z",
   "finished_at": "2026-04-27T00:00:03Z",
   "artifact": {
-    "path": "data/jobs/{job_id}/output/proxy.mp4"
+    "path": "data/jobs/{job_id}/output/proxy.{output_extension}"
   },
   "error": null
 }
@@ -166,9 +184,18 @@ Successful response headers:
 
 | Header | Value |
 |---|---|
-| `Content-Type` | derived from the profile's `output_extension` (for example `video/mp4` for `mp4`) |
+| `Content-Type` | derived from the profile's `output_extension` (see MIME mapping below) |
 | `Content-Disposition` | `attachment; filename="{job_id}.{output_extension}"` |
 | `Content-Length` | artifact byte size |
+
+MIME mapping from `output_extension` to `Content-Type`:
+
+| `output_extension` | `Content-Type` |
+|---|---|
+| `mp4` | `video/mp4` |
+| `webm` | `video/webm` |
+| `mp3` | `audio/mpeg` |
+| (other) | `application/octet-stream` |
 
 Errors:
 

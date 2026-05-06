@@ -1,4 +1,5 @@
 use crate::dedup::RegistryArc;
+use crate::ffmpeg::FfmpegRunner;
 use crate::queue::JobSender;
 use crate::shared::{DedupKey, Job};
 use crate::storage::Storage;
@@ -14,19 +15,20 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::fs;
 
+#[derive(Clone)]
 pub struct AppState {
     pub registry: RegistryArc,
     pub storage: Arc<Storage>,
     pub queue_tx: JobSender,
+    pub ffmpeg_runner: Arc<FfmpegRunner>,
 }
 
-impl Clone for AppState {
-    fn clone(&self) -> Self {
-        AppState {
-            registry: Arc::clone(&self.registry),
-            storage: self.storage.clone(),
-            queue_tx: self.queue_tx.clone(),
-        }
+fn ext_to_mime(ext: &str) -> &'static str {
+    match ext {
+        "mp4" => "video/mp4",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
     }
 }
 
@@ -222,32 +224,48 @@ pub async fn get_artifact(
     State(state): State<AppState>,
     Path(job_id): Path<uuid::Uuid>,
 ) -> Result<axum::response::Response, (StatusCode, String)> {
-    let registry = state.registry.lock().await;
-    let job = registry
-        .get_job(&job_id)
-        .ok_or((StatusCode::NOT_FOUND, format!("Job {} not found", job_id)))?;
+    // Snapshot the job under the registry lock and drop the lock before any I/O.
+    // This satisfies docs/ARCHITECTURE.md:88-97 (no .await while holding the lock).
+    let snapshot = {
+        let registry = state.registry.lock().await;
+        registry.get_job(&job_id).cloned()
+    };
+
+    let job = snapshot.ok_or((StatusCode::NOT_FOUND, format!("Job {} not found", job_id)))?;
 
     match job.status {
         crate::shared::JobStatus::Succeeded => {
-            if let Some(ref artifact) = job.artifact {
-                match fs::read(&artifact.path).await {
-                    Ok(bytes) => {
-                        let mime_str = "video/mp4";
-                        let mime: mime::Mime =
-                            mime_str.parse().unwrap_or(mime::APPLICATION_OCTET_STREAM);
-                        Ok(axum::response::Response::builder()
-                            .header("Content-Type", mime.to_string())
-                            .body(bytes.into())
-                            .unwrap())
-                    }
-                    Err(e) => Err((
+            // The artifact-missing-on-succeeded case keeps the existing 404; full
+            // artifact-endpoint status code alignment is the scope of issue #4.
+            let artifact = job
+                .artifact
+                .as_ref()
+                .ok_or((StatusCode::NOT_FOUND, "Artifact not found".to_string()))?;
+            let profile = state.ffmpeg_runner.get_profile(&job.profile).ok_or((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("profile '{}' missing at runtime", job.profile),
+            ))?;
+            let ext = profile.output_extension.clone();
+            let mime = ext_to_mime(&ext);
+            let bytes = fs::read(&artifact.path).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to read artifact: {}", e),
+                )
+            })?;
+            axum::response::Response::builder()
+                .header("Content-Type", mime)
+                .header(
+                    "Content-Disposition",
+                    format!("attachment; filename=\"{}.{}\"", job.job_id, ext),
+                )
+                .body(bytes.into())
+                .map_err(|e| {
+                    (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to read artifact: {}", e),
-                    )),
-                }
-            } else {
-                Err((StatusCode::NOT_FOUND, "Artifact not found".to_string()))
-            }
+                        format!("response build failed: {}", e),
+                    )
+                })
         }
         crate::shared::JobStatus::Queued | crate::shared::JobStatus::Running => Err((
             StatusCode::SERVICE_UNAVAILABLE,
@@ -264,11 +282,13 @@ pub fn create_router(
     registry: RegistryArc,
     storage: Arc<Storage>,
     queue_tx: JobSender,
+    ffmpeg_runner: Arc<FfmpegRunner>,
 ) -> Router {
     let state = AppState {
         registry,
         storage,
         queue_tx,
+        ffmpeg_runner,
     };
 
     Router::new()
@@ -278,4 +298,122 @@ pub fn create_router(
         .route("/api/jobs/{job_id}", get(get_job))
         .route("/api/jobs/{job_id}/artifact", get(get_artifact))
         .with_state(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dedup::create_registry;
+    use crate::ffmpeg::FfmpegProfile;
+    use crate::queue::create_queue;
+    use crate::shared::Job;
+
+    #[test]
+    fn ext_to_mime_covers_known_and_unmapped_branches() {
+        assert_eq!(ext_to_mime("mp4"), "video/mp4");
+        assert_eq!(ext_to_mime("webm"), "video/webm");
+        assert_eq!(ext_to_mime("mp3"), "audio/mpeg");
+        // Anything that passes `validate_output_extension` but is not in the
+        // known table must still fall back to a usable response type.
+        assert_eq!(ext_to_mime("mov"), "application/octet-stream");
+    }
+
+    fn make_state_with_succeeded_job(
+        ext: &str,
+        profile_name: &str,
+        artifact_bytes: &[u8],
+    ) -> (AppState, uuid::Uuid, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let artifact_path = tmp.path().join(format!("proxy.{}", ext));
+        std::fs::write(&artifact_path, artifact_bytes).expect("write artifact");
+
+        let registry = create_registry();
+        let job_id = uuid::Uuid::new_v4();
+        {
+            let mut reg = registry.try_lock().expect("uncontended");
+            let mut job = Job::new(job_id, profile_name.to_string(), "deadbeef".to_string());
+            job.start().expect("start");
+            job.succeed(artifact_path.clone()).expect("succeed");
+            reg.jobs.insert(job_id, job);
+        }
+
+        let storage = Arc::new(Storage::new(tmp.path()));
+        let runner = Arc::new(FfmpegRunner::new(vec![FfmpegProfile {
+            name: profile_name.to_string(),
+            args: vec![],
+            output_extension: ext.to_string(),
+        }]));
+
+        let (queue_tx, _queue_rx) = create_queue();
+        let state = AppState {
+            registry,
+            storage,
+            queue_tx,
+            ffmpeg_runner: runner,
+        };
+        (state, job_id, tmp)
+    }
+
+    fn header_str<'a>(resp: &'a axum::response::Response, name: &str) -> &'a str {
+        resp.headers()
+            .get(name)
+            .expect("header present")
+            .to_str()
+            .expect("ascii")
+    }
+
+    #[tokio::test]
+    async fn artifact_headers_derive_from_output_extension() {
+        let cases: &[(&str, &str, &str, &[u8])] = &[
+            ("mp4", "web_720p", "video/mp4", b"\0\0\0 ftypmp42"),
+            ("webm", "web_720p_webm", "video/webm", b"\x1aE\xdf\xa3"),
+        ];
+        for (ext, profile_name, mime, bytes) in cases {
+            let (state, job_id, _tmp) = make_state_with_succeeded_job(ext, profile_name, bytes);
+            let resp = get_artifact(State(state), Path(job_id)).await.expect("ok");
+            assert_eq!(header_str(&resp, "Content-Type"), *mime);
+            assert_eq!(
+                header_str(&resp, "Content-Disposition"),
+                format!("attachment; filename=\"{}.{}\"", job_id, ext)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn artifact_handler_returns_500_when_profile_lookup_fails() {
+        // Build state with a profile that does NOT match the job's profile name.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let artifact_path = tmp.path().join("proxy.mp4");
+        std::fs::write(&artifact_path, b"x").expect("write");
+
+        let registry = create_registry();
+        let job_id = uuid::Uuid::new_v4();
+        {
+            let mut reg = registry.try_lock().expect("uncontended");
+            let mut job = Job::new(job_id, "vanished_profile".to_string(), "h".to_string());
+            job.start().expect("start");
+            job.succeed(artifact_path).expect("succeed");
+            reg.jobs.insert(job_id, job);
+        }
+
+        let storage = Arc::new(Storage::new(tmp.path()));
+        let runner = Arc::new(FfmpegRunner::new(vec![FfmpegProfile {
+            name: "different_profile".to_string(),
+            args: vec![],
+            output_extension: "mp4".to_string(),
+        }]));
+        let (queue_tx, _queue_rx) = create_queue();
+        let state = AppState {
+            registry,
+            storage,
+            queue_tx,
+            ffmpeg_runner: runner,
+        };
+
+        let err = get_artifact(State(state), Path(job_id))
+            .await
+            .expect_err("err");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains("profile 'vanished_profile'"), "{}", err.1);
+    }
 }

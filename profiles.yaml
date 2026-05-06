@@ -1,0 +1,9 @@
+- name: web_720p
+  args: ["-vf", "scale=1280:720"]
+  output_extension: mp4
+- name: web_480p
+  args: ["-vf", "scale=854:480"]
+  output_extension: mp4
+- name: web_720p_webm
+  args: ["-vf", "scale=1280:720", "-c:v", "libvpx-vp9", "-c:a", "libopus"]
+  output_extension: webm

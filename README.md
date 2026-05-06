@@ -168,6 +168,22 @@ Clients send only a profile name. Raw FFmpeg arguments from clients are not acce
 - local filesystem artifacts
 - focused concurrency and state-machine tests
 
+## Profile Configuration
+
+When `profiles.yaml` exists at the repository root, the server loads it on startup. If the file is absent, hard-coded fallback profiles (`web_720p`, `web_480p`, both `mp4`) are used instead.
+
+A minimal profile entry looks like:
+
+```yaml
+- name: web_720p_webm
+  args: ["-vf", "scale=1280:720", "-c:v", "libvpx-vp9", "-c:a", "libopus"]
+  output_extension: webm
+```
+
+The `output_extension` field is optional and defaults to `mp4`. It must match `^[a-z0-9]{1,8}$` — startup fails if a profile uses a leading dot, uppercase letters, slashes, whitespace, or an empty string. The same value is used for both the worker output filename (`proxy.{output_extension}`) and the artifact download filename (`{job_id}.{output_extension}`).
+
+See [API specification](docs/API_SPEC.md#profile-configuration) for the full schema and the extension-to-MIME mapping used by `GET /api/jobs/{job_id}/artifact`.
+
 ## Out of Scope
 
 - database persistence, including SQLite and PostgreSQL

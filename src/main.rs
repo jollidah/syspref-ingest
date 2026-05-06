@@ -48,23 +48,29 @@ async fn main() -> Result<()> {
         String::new()
     };
 
-    // Parse profiles (default if empty)
+    // Parse profiles (default if empty). Fallback profiles still need to satisfy
+    // validate_output_extension; YAML-loaded profiles are validated inside
+    // load_profiles_from_yaml so we only re-validate on the fallback path.
     let profiles = if profiles_yaml.is_empty() {
-        vec![
+        let fallback = vec![
             FfmpegProfile {
                 name: "web_720p".to_string(),
                 args: vec!["-vf".to_string(), "scale=1280:720".to_string()],
+                output_extension: "mp4".to_string(),
             },
             FfmpegProfile {
                 name: "web_480p".to_string(),
                 args: vec!["-vf".to_string(), "scale=854:480".to_string()],
+                output_extension: "mp4".to_string(),
             },
-        ]
+        ];
+        ffmpeg::validate_profiles(&fallback)?;
+        fallback
     } else {
         ffmpeg::load_profiles_from_yaml(&profiles_yaml)?
     };
 
-    let ffmpeg_runner = FfmpegRunner::new(profiles);
+    let ffmpeg_runner = std::sync::Arc::new(FfmpegRunner::new(profiles));
 
     // Initialize shared state
     let registry: RegistryArc = create_registry();
@@ -76,13 +82,13 @@ async fn main() -> Result<()> {
         4,
         registry.clone(),
         queue_rx.clone(),
-        ffmpeg_runner,
+        ffmpeg_runner.clone(),
         storage.clone(),
     );
     worker_pool.start().await;
 
-    // Create router (producer side holds the sender)
-    let app = api::create_router(registry, storage.clone(), queue_tx)
+    // Create router (producer side holds the sender + profile lookup)
+    let app = api::create_router(registry, storage.clone(), queue_tx, ffmpeg_runner)
         .layer(TraceLayer::new_for_http());
 
     // Start server
