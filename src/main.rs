@@ -95,8 +95,14 @@ async fn main() -> Result<()> {
     worker_pool.start().await;
 
     // Create router (producer side holds the sender + profile lookup via trait)
-    let app = api::create_router(registry, storage.clone(), queue_tx, transcoder)
-        .layer(TraceLayer::new_for_http());
+    let app = api::create_router(
+        registry,
+        storage.clone(),
+        queue_tx,
+        transcoder,
+        config.max_upload_bytes,
+    )
+    .layer(TraceLayer::new_for_http());
 
     // Start server
     let addr = config.bind.parse::<std::net::SocketAddr>()?;

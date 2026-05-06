@@ -284,6 +284,16 @@ pub enum AppError {
     MissingFile,
     #[error("profile field is missing")]
     MissingProfile,
+    // The carried profile name is intentionally NOT interpolated into Display
+    // so the IntoResponse path (which uses Display as the client message)
+    // cannot leak the rejected profile name. The String is kept for server-
+    // side Debug logging only.
+    #[error("profile does not exist")]
+    UnknownProfile(String),
+    #[error("invalid multipart request")]
+    InvalidMultipart,
+    #[error("request body exceeds limit")]
+    PayloadTooLarge,
     #[error("artifact is not ready")]
     ArtifactNotReady,
     #[error("job failed")]
@@ -307,6 +317,11 @@ impl IntoResponse for AppError {
             AppError::JobNotFound(_) => (StatusCode::NOT_FOUND, "unknown_job_id", display),
             AppError::MissingFile => (StatusCode::BAD_REQUEST, "missing_file", display),
             AppError::MissingProfile => (StatusCode::BAD_REQUEST, "missing_profile", display),
+            AppError::UnknownProfile(_) => (StatusCode::BAD_REQUEST, "unknown_profile", display),
+            AppError::InvalidMultipart => (StatusCode::BAD_REQUEST, "invalid_multipart", display),
+            AppError::PayloadTooLarge => {
+                (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", display)
+            }
             AppError::ArtifactNotReady => (StatusCode::CONFLICT, "artifact_not_ready", display),
             AppError::JobFailed => (StatusCode::CONFLICT, "job_failed", display),
             _ => (

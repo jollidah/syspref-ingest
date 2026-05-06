@@ -5,8 +5,8 @@ use crate::shared::{AppError, DedupKey, Job, JobStatus};
 use crate::storage::Storage;
 use axum::{
     body::{Body, Bytes},
-    extract::multipart::Multipart,
-    extract::{Path, State},
+    extract::multipart::{Multipart, MultipartError, MultipartRejection},
+    extract::{DefaultBodyLimit, Path, State},
     http::{header, StatusCode},
     response::{Json, Response},
     routing::{get, post},
@@ -16,6 +16,18 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::fs;
 use tokio_util::io::ReaderStream;
+
+/// Map a `MultipartError` raised during field iteration to the corresponding
+/// `AppError`. `DefaultBodyLimit` overages surface here (status 413), while
+/// any other parse failure (truncated body, header errors, etc.) is treated
+/// as a wire-protocol violation.
+fn map_multipart_err(err: MultipartError) -> AppError {
+    if err.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        AppError::PayloadTooLarge
+    } else {
+        AppError::InvalidMultipart
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,20 +61,20 @@ pub async fn health() -> Json<serde_json::Value> {
 
 pub async fn create_job(
     State(state): State<AppState>,
-    mut multipart: Multipart,
+    multipart: Result<Multipart, MultipartRejection>,
 ) -> Result<(StatusCode, Json<serde_json::Value>), AppError> {
+    // Extractor-level rejection (missing/invalid boundary, non-multipart
+    // `Content-Type`, etc.) maps to `invalid_multipart`. axum 0.7 surfaces
+    // `DefaultBodyLimit` overages later, via `MultipartError::status() == 413`
+    // inside the field iteration loop, not here.
+    let mut multipart = multipart.map_err(|_| AppError::InvalidMultipart)?;
+
     let mut file_data: Option<(String, String)> = None;
     let mut profile_str: Option<String> = None;
 
-    // Multipart parse failures map best-effort to MissingFile/MissingProfile;
-    // #6 (input validation) will tighten the wire-protocol error mapping.
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|_| AppError::MissingFile)?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(map_multipart_err)? {
         let name = field.name().unwrap_or("").to_string();
-        let bytes: Bytes = field.bytes().await.map_err(|_| AppError::MissingFile)?;
+        let bytes: Bytes = field.bytes().await.map_err(map_multipart_err)?;
 
         if name == "file" {
             let mut hasher = Sha256::new();
@@ -75,13 +87,43 @@ pub async fn create_job(
 
             file_data = Some((hash, filename));
         } else if name == "profile" {
-            profile_str =
-                Some(String::from_utf8(bytes.to_vec()).map_err(|_| AppError::MissingProfile)?);
+            // Wire/encoding-level violation -> invalid_multipart, distinct
+            // from the structural missing_profile case (= valid multipart
+            // with no `profile` field at all). Clean up any tmp the `file`
+            // branch already staged before returning, since this PR owns
+            // this new error path.
+            profile_str = Some(match String::from_utf8(bytes.to_vec()) {
+                Ok(s) => s,
+                Err(_) => {
+                    if let Some((_, prev_filename)) = &file_data {
+                        let _ = state.storage.cleanup_tmp(prev_filename);
+                    }
+                    return Err(AppError::InvalidMultipart);
+                }
+            });
         }
     }
 
     let (content_hash, filename) = file_data.ok_or(AppError::MissingFile)?;
-    let profile = profile_str.ok_or(AppError::MissingProfile)?;
+
+    // From here on the file has been staged to tmp, so the validation
+    // failures introduced by this PR (`missing_profile` after a file field,
+    // `unknown_profile`) clean it up explicitly before returning.
+    let profile = match profile_str {
+        Some(p) => p,
+        None => {
+            let _ = state.storage.cleanup_tmp(&filename);
+            return Err(AppError::MissingProfile);
+        }
+    };
+
+    // Synchronous, lock-free profile validation. `Transcoder::get_profile`
+    // is sync, so this satisfies the "no `.await` while holding the registry
+    // lock" rule trivially — we validate before taking the registry lock.
+    if state.transcoder.get_profile(&profile).is_none() {
+        let _ = state.storage.cleanup_tmp(&filename);
+        return Err(AppError::UnknownProfile(profile));
+    }
 
     let key = DedupKey::new(content_hash.clone(), profile.clone());
     let profile_for_response = profile.clone();
@@ -255,6 +297,7 @@ pub fn create_router(
     storage: Arc<Storage>,
     queue_tx: JobSender,
     transcoder: Arc<dyn Transcoder>,
+    max_upload_bytes: usize,
 ) -> Router {
     let state = AppState {
         registry,
@@ -264,9 +307,16 @@ pub fn create_router(
     };
 
     // axum 0.7 + matchit 0.7 use ":name" path-param syntax; "{name}" is matchit 0.8 / axum 0.8.
+    // The body-limit layer is attached only to POST /api/jobs because the
+    // GET endpoints carry no request body. axum 0.7 surfaces an overage as
+    // `MultipartError::status() == 413`, which `map_multipart_err` maps to
+    // `AppError::PayloadTooLarge`.
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/jobs", post(create_job))
+        .route(
+            "/api/jobs",
+            post(create_job).layer(DefaultBodyLimit::max(max_upload_bytes)),
+        )
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/:job_id", get(get_job))
         .route("/api/jobs/:job_id/artifact", get(get_artifact))
@@ -294,7 +344,16 @@ mod tests {
         }]))
     }
 
+    /// Default test router with a generous body limit (1 MiB) so existing
+    /// happy-path / dedup / artifact tests are unaffected by the upload cap.
+    /// Body-limit-specific tests build their own router via `router_with_limit`.
     fn router() -> (Router, RegistryArc, Arc<Storage>, JobReceiver) {
+        router_with_limit(1024 * 1024)
+    }
+
+    fn router_with_limit(
+        max_upload_bytes: usize,
+    ) -> (Router, RegistryArc, Arc<Storage>, JobReceiver) {
         let registry = create_registry();
         let tmp = std::env::temp_dir().join(format!("syspref_test_{}", uuid::Uuid::new_v4()));
         let storage = Arc::new(Storage::new(&tmp));
@@ -305,6 +364,7 @@ mod tests {
             storage.clone(),
             queue_tx,
             test_transcoder(),
+            max_upload_bytes,
         );
         // Return queue_rx so it stays alive in the test scope; otherwise
         // queue_tx.send() in create_job's staging fails with channel closed.
@@ -716,5 +776,160 @@ mod tests {
             assert_eq!(status, want_status, "id={id}");
             assert_eq!(body["error"]["code"], want_code, "id={id}");
         }
+    }
+
+    // ---------- HTTP-level acceptance for issue #6 (request validation) ----------
+
+    /// E3: unregistered profile name is rejected before staging/enqueue with
+    /// the documented 400 + `unknown_profile` envelope. Side-assertion: the
+    /// tmp directory is empty afterwards (cleanup wrapper) and no job /
+    /// dedup entry was created in the registry, no enqueue happened.
+    #[tokio::test]
+    async fn post_unknown_profile_returns_400_envelope_and_cleans_up() {
+        let (app, registry, storage, queue_rx) = router();
+        let boundary = "BNDRY";
+        let body = multipart_body(boundary, b"hello world", "does_not_exist");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, json) = read_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "unknown_profile");
+        // Display intentionally hides the offending profile name.
+        assert_eq!(json["error"]["message"], "profile does not exist");
+        assert!(!json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("does_not_exist"));
+
+        // Side assertions: registry and queue are untouched.
+        let registry_state = registry.lock().await;
+        assert!(registry_state.dedup.is_empty(), "dedup map must be empty");
+        assert!(registry_state.jobs.is_empty(), "jobs map must be empty");
+        drop(registry_state);
+        assert!(
+            queue_rx.lock().await.try_recv().is_err(),
+            "queue must be empty"
+        );
+
+        // Side assertion: no leftover tmp file. `tmp_path("")` returns the
+        // tmp directory itself (base_path/tmp), which Storage::ensure_exists
+        // creates upfront, so it should exist but be empty after cleanup.
+        let tmp_dir = storage.tmp_path("");
+        let entries: Vec<_> = std::fs::read_dir(&tmp_dir)
+            .unwrap_or_else(|e| panic!("read tmp dir {tmp_dir:?}: {e}"))
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "tmp dir must be empty, found: {entries:?}"
+        );
+    }
+
+    /// E4 + L1: the configured body limit produces a 413 + `payload_too_large`
+    /// JSON envelope (not the default plain-text rejection). Proves that
+    /// `DefaultBodyLimit` overage flows through `MultipartError::status()`
+    /// into the handler so envelope mapping kicks in.
+    #[tokio::test]
+    async fn post_oversized_body_returns_413_envelope() {
+        // Tight cap so a small but normal-looking multipart body trips it.
+        let (app, _registry, _storage, _queue_rx) = router_with_limit(256);
+        let boundary = "BNDRY";
+        // ~1 KiB file payload guarantees the encoded body exceeds 256 bytes.
+        let payload = vec![b'A'; 1024];
+        let body = multipart_body(boundary, &payload, "p");
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, json) = read_json(resp).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(json["error"]["code"], "payload_too_large");
+        assert_eq!(json["error"]["message"], "request body exceeds limit");
+    }
+
+    /// C5 / C10: malformed multipart at the wire-protocol layer maps to
+    /// 400 + `invalid_multipart`. Covers the extractor-level rejection
+    /// (non-multipart Content-Type).
+    #[tokio::test]
+    async fn post_non_multipart_content_type_returns_invalid_multipart() {
+        let (app, _registry, _storage, _queue_rx) = router();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header("Content-Type", "application/json")
+            .body(axum::body::Body::from(r#"{"profile":"p"}"#))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, json) = read_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "invalid_multipart");
+        assert_eq!(json["error"]["message"], "invalid multipart request");
+    }
+
+    /// C5: invalid UTF-8 bytes in the `profile` field surface as
+    /// `invalid_multipart`, not `missing_profile` — the multipart envelope is
+    /// well-formed but the field's payload violates the textual contract.
+    /// Side-assertion: when the invalid `profile` arrives AFTER a valid
+    /// `file` part, the staged tmp must be cleaned up (this PR introduced
+    /// the InvalidMultipart mapping and owns the cleanup).
+    #[tokio::test]
+    async fn post_invalid_utf8_profile_returns_invalid_multipart() {
+        let (app, _registry, storage, _queue_rx) = router();
+        let boundary = "BNDRY";
+        // Build a multipart body where the `profile` part contains a lone
+        // 0xFF byte (invalid UTF-8). `file` part is included first so the
+        // tmp-cleanup side-assertion has something to verify.
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            b"Content-Disposition: form-data; name=\"file\"; filename=\"v.mp4\"\r\n\r\n",
+        );
+        body.extend_from_slice(b"hello");
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"profile\"\r\n\r\n");
+        body.extend_from_slice(&[0xFFu8]);
+        body.extend_from_slice(b"\r\n");
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/jobs")
+            .header(
+                "Content-Type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let (status, json) = read_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["error"]["code"], "invalid_multipart");
+
+        let tmp_dir = storage.tmp_path("");
+        let entries: Vec<_> = std::fs::read_dir(&tmp_dir)
+            .unwrap_or_else(|e| panic!("read tmp dir {tmp_dir:?}: {e}"))
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "tmp dir must be empty after invalid-utf8 profile, found: {entries:?}"
+        );
     }
 }

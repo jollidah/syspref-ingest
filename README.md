@@ -184,6 +184,12 @@ The `output_extension` field is optional and defaults to `mp4`. It must match `^
 
 See [API specification](docs/API_SPEC.md#profile-configuration) for the full schema and the extension-to-MIME mapping used by `GET /api/jobs/{job_id}/artifact`.
 
+## Upload Size Limit
+
+`POST /api/jobs` rejects requests whose encoded multipart body exceeds `--max-upload-bytes` (default 50 MiB) with a `413 payload_too_large` envelope. The limit applies to the entire encoded body, including boundary delimiters and part headers, not just the file contents.
+
+`--max-upload-bytes` is a per-request cap; it does not bound the number of concurrent uploads. With the current buffered upload path each in-flight request can hold up to the limit in memory, so concurrent traffic should be sized accordingly. True streaming with bounded memory is tracked by the streaming follow-up issue.
+
 ## Out of Scope
 
 - database persistence, including SQLite and PostgreSQL
